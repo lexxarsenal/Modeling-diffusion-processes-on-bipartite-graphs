@@ -1,0 +1,79 @@
+import numpy as np
+import networkx as nx
+from scipy.integrate import solve_ivp
+from typing import Optional, Tuple
+
+def continuous_mean_field_sis(
+    G: nx.Graph,
+    is_group: dict,
+    beta_gu: float = 0.02,
+    beta_ug: float = 0.02,
+    gamma_u: float = 0.0,
+    gamma_g: float = 0.0,
+    t_span: Tuple[float, float] = (0, 20),
+    source_node: Optional = None,
+    exp_factor_u: Optional[float] = None,
+    exp_factor_g: Optional[float] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized continuous mean‑field SIS model on a bipartite graph.
+    """
+    nodes = list(G.nodes())
+    n = len(nodes)
+
+    # Node types
+    is_group_array = np.array([is_group[node] for node in nodes], dtype=bool)
+    user_indices = np.where(~is_group_array)[0]
+    group_indices = np.where(is_group_array)[0]
+    n_users = len(user_indices)
+    n_groups = len(group_indices)
+
+    if n_users == 0 or n_groups == 0:
+        raise ValueError("Both users and groups must be present")
+
+    # Adjacency matrix (sparse)
+    A = nx.adjacency_matrix(G, nodelist=nodes).astype(float)
+
+    # Initial conditions
+    y0 = np.zeros(n)
+    if source_node is not None and source_node in G:
+        src_idx = nodes.index(source_node)
+        y0[src_idx] = 1.0
+    else:
+        y0[0] = 1.0
+
+    # Precompute gamma vector (constant over time)
+    gamma_vec = np.where(is_group_array, gamma_g, gamma_u)
+
+    def ode_system(t, y):
+        # Infected neighbors sum for each node (vectorized)
+        infected_neighbors = A.dot(y)
+
+        # Time-dependent infection rates
+        beta_gu_t = beta_gu * np.exp(-exp_factor_u * t) if exp_factor_u is not None else beta_gu
+        beta_ug_t = beta_ug * np.exp(-exp_factor_g * t) if exp_factor_g is not None else beta_ug
+
+        # Infection rate per node (depending on type)
+        beta_vec = np.where(is_group_array, beta_ug_t, beta_gu_t)
+
+        # Vectorized derivative
+        infection = beta_vec * (1.0 - y) * infected_neighbors
+        recovery = gamma_vec * y
+        dydt = infection - recovery
+
+        return dydt
+
+    # Solve ODE
+    sol = solve_ivp(ode_system, t_span, y0,
+                    method='RK45', rtol=1e-6, atol=1e-8,
+                    dense_output=True)
+
+    # Evaluate at integer times
+    t_eval = np.arange(int(t_span[0]), int(t_span[1]) + 1)
+    y_solution = sol.sol(t_eval)   # shape (n, len(t_eval))
+
+    # Fractions of infected
+    users_frac = np.sum(y_solution[user_indices, :], axis=0) / n_users
+    groups_frac = np.sum(y_solution[group_indices, :], axis=0) / n_groups
+
+    return users_frac, groups_frac, t_eval
