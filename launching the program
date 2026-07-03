@@ -1,0 +1,98 @@
+G = create_bipartite_graph_powerlaw(10000, 5000, 1.6, 1.6, seed=21)
+print("Количество изолированных вершин:", sum(1 for n in G.nodes() if G.degree(n) == 0))  # будет 0
+print("Связен ли граф? ", nx.is_connected(G))  # вероятно, True или очень мало компонент
+
+results = analyze_degree_distribution_improved(G, "Название вашей сети", 
+                                              use_log_binning=True, 
+                                              num_bins=25)
+
+results = analyze_degree_distribution_improved(G, "Название вашей сети", 
+                                              use_log_binning=True, 
+                                              num_bins=25)
+
+# Правильно создаём is_group из графа G
+is_group = {n: G.nodes[n]['bipartite'] == 1 for n in G.nodes()}
+
+# Теперь разделяем узлы
+users = [n for n in G.nodes() if not is_group[n]]
+groups = [n for n in G.nodes() if is_group[n]]
+
+# Далее — ваш код без изменений
+user_degrees = {u: G.degree(u) for u in users}
+top_users = sorted(user_degrees.items(), key=lambda x: x[1], reverse=True)[1:10]
+
+group_degrees = {g: G.degree(g) for g in groups}
+top_groups = sorted(group_degrees.items(), key=lambda x: x[1], reverse=True)[300:400]
+
+print("\nТоп-5 пользователей:")
+for u, deg in top_users:
+    print(f"  {u}: степень = {deg}")
+
+print("\nТоп-5 групп:")
+for g, deg in top_groups:
+    print(f"  {g}: степень = {deg}")
+
+source = "group_3179"
+max_t =170
+beta_gu=0.03
+beta_ug=0.01
+gamma_u=0.0
+gamma_g=0.0
+import time
+start_time = time.time()
+users_sample, groups_sample, t_eval, meta = gillespie_sis_bipartite_ensemble(
+    G, 
+    is_group, 
+    beta_UG=beta_ug, 
+    beta_GU=beta_gu, 
+    max_time=max_t,
+    gamma_U=gamma_u,
+    gamma_G=gamma_g,
+    source_node=source,
+    n_samples=100,
+    n_jobs=-1,
+    seed=42
+)
+
+end_time = time.time()
+gillespie_time = end_time - start_time
+print(f"Gillespie time: {gillespie_time:.2f} seconds")
+
+### Вариант 2: Модель с exp_factor (как в вашей оригинальной)
+start = time.time()
+users_ode_exp, groups_ode_exp, t_ode_exp = continuous_mean_field_sis(
+    G, is_group, beta_gu=beta_gu, beta_ug=beta_ug, gamma_u=gamma_u,gamma_g=gamma_g,
+    t_span=(0, max_t), source_node=source
+    )
+ibmf_time = time.time() - start
+
+start = time.time()
+users_curve, groups_curve, t_eval, metadata = sis_bipartite_hmf(
+    G, 
+    is_group, 
+    beta_UG=beta_ug,   # Пользователь → Группа
+    beta_GU=beta_gu,    # Группа → Пользователь
+    gamma_U=gamma_u,
+    gamma_G=gamma_g,
+    t_span=(0, max_t),
+    source_node=source,  # Начинаем с группы
+    discrete_beta=False,
+    seed=8
+)
+dba_time = time.time() - start
+
+# Вывод сравнения
+print(f"IBMF time: {ibmf_time:.4f} sec")
+#print(f"DBA time cor: {dba_cor_time:.4f} sec")
+print(f"DBA time: {dba_time:.4f} sec")
+print(f"Speedup: Gillespie/IBMF = {gillespie_time/ibmf_time:.1f}x, Gillespie/DBA = {gillespie_time/dba_time:.1f}x")
+
+ibmf_users=users_ode_exp
+ibmf_groups=groups_ode_exp
+dba_users=users_curve
+dba_groups=groups_curve
+
+
+
+
+
