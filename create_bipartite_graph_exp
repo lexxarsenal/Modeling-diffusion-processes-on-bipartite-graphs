@@ -1,0 +1,67 @@
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter
+
+def create_bipartite_graph_exp(n_users, n_groups, lambda_exp, alpha_powerlaw):
+    """
+    Создает двудольный граф с экспоненциальным распределением для пользователей
+    и степенным законом для групп
+    
+    Parameters:
+    n_users: количество пользователей
+    n_groups: количество групп
+    lambda_exp: параметр лямбда для экспоненциального распределения (среднее = 1/λ)
+    alpha_powerlaw: параметр альфа для степенного закона
+    """
+    # Создаем пустой двудольный граф
+    G = nx.Graph()
+    
+    # Добавляем узлы двух типов
+    users = [f"user_{i}" for i in range(n_users)]
+    groups = [f"group_{i}" for i in range(n_groups)]
+    
+    G.add_nodes_from(users, bipartite=0)  # пользователи
+    G.add_nodes_from(groups, bipartite=1)  # группы
+    
+    # Генерируем степени для групп по степенному закону
+    group_degrees = np.random.zipf(alpha_powerlaw, n_groups)
+    group_degrees = np.clip(group_degrees, 1, n_users)  # ограничиваем максимальную степень
+    
+    # Генерируем степени для пользователей по экспоненциальному распределению
+    # Экспоненциальное распределение дает положительные вещественные числа,
+    # поэтому преобразуем в целые и ограничиваем диапазон
+    user_degrees = np.random.exponential(1/lambda_exp, n_users)
+    user_degrees = np.ceil(user_degrees).astype(int)  # округляем вверх до целого
+    user_degrees = np.clip(user_degrees, 1, n_groups)  # гарантируем минимум 1 связь и максимум n_groups
+    
+    # Нормализуем общую сумму степеней
+    total_group_degree = sum(group_degrees)
+    total_user_degree = sum(user_degrees)
+    
+    # Масштабируем степени, чтобы суммы совпадали
+    if total_group_degree > total_user_degree:
+        scale_factor = total_user_degree / total_group_degree
+        group_degrees = np.maximum(1, (group_degrees * scale_factor).astype(int))
+    else:
+        scale_factor = total_group_degree / total_user_degree
+        user_degrees = np.maximum(1, (user_degrees * scale_factor).astype(int))
+    
+    # Создаем конфигурационную модель
+    user_stubs = []
+    for i, deg in enumerate(user_degrees):
+        user_stubs.extend([users[i]] * deg)
+    
+    group_stubs = []
+    for i, deg in enumerate(group_degrees):
+        group_stubs.extend([groups[i]] * deg)
+    
+    # Перемешиваем списки
+    np.random.shuffle(user_stubs)
+    np.random.shuffle(group_stubs)
+    
+    # Добавляем ребра
+    for user, group in zip(user_stubs, group_stubs):
+        G.add_edge(user, group)
+    
+    return G
