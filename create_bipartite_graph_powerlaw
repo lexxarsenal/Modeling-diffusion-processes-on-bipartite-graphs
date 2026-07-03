@@ -1,0 +1,130 @@
+import networkx as nx
+import numpy as np
+
+def make_connected_bipartite(G):
+    """
+    Соединяет все компоненты двудольного графа в одну, добавляя минимальное количество рёбер.
+    Ребро всегда соединяет вершины разных типов (пользователь-группа).
+    
+    Parameters:
+    G : nx.Graph
+        Двудольный граф.
+    
+    Returns:
+    G : nx.Graph
+        Связный двудольный граф.
+    """
+    components = list(nx.connected_components(G))
+    if len(components) <= 1:
+        return G
+    
+    # Самая большая компонента станет основной
+    giant = max(components, key=len)
+    small_components = [comp for comp in components if comp != giant]
+    
+    for comp in small_components:
+        # Разделяем вершины малой компоненты по типам
+        comp_users = [n for n in comp if G.nodes[n]['bipartite'] == 0]
+        comp_groups = [n for n in comp if G.nodes[n]['bipartite'] == 1]
+        
+        # Вершины гигантской компоненты по типам
+        giant_users = [n for n in giant if G.nodes[n]['bipartite'] == 0]
+        giant_groups = [n for n in giant if G.nodes[n]['bipartite'] == 1]
+        
+        # Соединяем, подбирая пару с разными типами
+        if comp_users and giant_groups:
+            u = np.random.choice(comp_users)
+            v = np.random.choice(giant_groups)
+        elif comp_groups and giant_users:
+            u = np.random.choice(comp_groups)
+            v = np.random.choice(giant_users)
+        else:
+            # Теоретически двудольный граф с рёбрами не может иметь компоненту из одного типа,
+            # но изолированная вершина – исключение. В этом случае другая часть условия сработает.
+            # Если же оба условия не выполнились (например, giant не содержит ни одного пользователя),
+            # то выбираем любую пару вершин разных типов из объединения компонент.
+            # Это крайний случай, но для надёжности:
+            all_users = [n for n in G.nodes() if G.nodes[n]['bipartite'] == 0]
+            all_groups = [n for n in G.nodes() if G.nodes[n]['bipartite'] == 1]
+            if comp_users and all_groups:
+                u = np.random.choice(comp_users)
+                v = np.random.choice(all_groups)
+            elif comp_groups and all_users:
+                u = np.random.choice(comp_groups)
+                v = np.random.choice(all_users)
+            else:
+                continue  # Не удалось соединить (почти невозможно)
+        
+        G.add_edge(u, v)
+        # Добавляем всю малую компоненту в гигантскую
+        giant.update(comp)
+    
+    return G
+
+def create_bipartite_graph_powerlaw(n_users, n_groups, alpha_users, alpha_groups, seed=2):
+    """
+    Создаёт связный двудольный граф со степенным распределением для пользователей и групп.
+    Изолированные вершины и маленькие компоненты присоединяются к основной.
+    
+    Parameters:
+    n_users : int
+        Количество пользователей.
+    n_groups : int
+        Количество групп.
+    alpha_users : float
+        Параметр степенного распределения для пользователей.
+    alpha_groups : float
+        Параметр степенного распределения для групп.
+    seed : int
+        seed для воспроизводимости.
+    
+    Returns:
+    G : nx.Graph
+        Связный двудольный граф.
+    """
+    np.random.seed(seed)
+    G = nx.Graph()
+    
+    users = [f"user_{i}" for i in range(n_users)]
+    groups = [f"group_{i}" for i in range(n_groups)]
+    
+    G.add_nodes_from(users, bipartite=0)
+    G.add_nodes_from(groups, bipartite=1)
+    
+    # Генерация степеней по степенному закону
+    group_degrees = np.random.zipf(alpha_groups, n_groups)
+    group_degrees = np.clip(group_degrees, 1, n_users)
+    
+    user_degrees = np.random.zipf(alpha_users, n_users)
+    user_degrees = np.clip(user_degrees, 1, n_groups)
+    
+    # Балансировка сумм степеней
+    total_group = sum(group_degrees)
+    total_user = sum(user_degrees)
+    
+    if total_group > total_user:
+        scale = total_user / total_group
+        group_degrees = np.maximum(1, (group_degrees * scale).astype(int))
+    else:
+        scale = total_group / total_user
+        user_degrees = np.maximum(1, (user_degrees * scale).astype(int))
+    
+    # Конфигурационная модель
+    user_stubs = []
+    for i, d in enumerate(user_degrees):
+        user_stubs.extend([users[i]] * d)
+    
+    group_stubs = []
+    for i, d in enumerate(group_degrees):
+        group_stubs.extend([groups[i]] * d)
+    
+    np.random.shuffle(user_stubs)
+    np.random.shuffle(group_stubs)
+    
+    for u, g in zip(user_stubs, group_stubs):
+        G.add_edge(u, g)
+    
+    # Делаем граф связным
+    G = make_connected_bipartite(G)
+    
+    return G
