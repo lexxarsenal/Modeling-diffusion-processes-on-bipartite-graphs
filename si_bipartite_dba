@@ -1,0 +1,218 @@
+import numpy as np
+import networkx as nx
+from scipy.integrate import solve_ivp
+from typing import Dict, Optional, Tuple
+import warnings
+
+def sis_bipartite_hmf(
+    G: nx.Graph,
+    is_group: Dict,              # {node: True if group, False if user}
+    beta_UG: float = 0.1,        # User → Group infection rate (continuous)
+    beta_GU: float = 0.3,        # Group → User infection rate (continuous)
+    gamma_U: float = 0.0,        # User recovery rate
+    gamma_G: float = 0.0,        # Group recovery rate
+    t_span: Tuple[float, float] = (0, 20),
+    source_node: Optional = None,
+    seed: Optional[int] = None,
+    discrete_beta: bool = True,  # Convert discrete probabilities to continuous rates
+    rtol: float = 1e-6,
+    atol: float = 1e-8
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+    """
+    Susceptible-Infected-Susceptible (SIS) model on a bipartite graph (HMF approach).
+
+    Returns fractions of infected users and groups over time, plus metadata.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # === 1. Prepare node types ===
+    nodes = list(G.nodes())
+    n_total = len(nodes)
+
+    if n_total == 0:
+        t_eval = np.arange(int(t_span[0]), int(t_span[1]) + 1)
+        return np.zeros(len(t_eval)), np.zeros(len(t_eval)), t_eval, {}
+
+    user_nodes = [n for n in nodes if not is_group[n]]
+    group_nodes = [n for n in nodes if is_group[n]]
+
+    n_users = len(user_nodes)
+    n_groups = len(group_nodes)
+
+    if n_users == 0 or n_groups == 0:
+        warnings.warn("Graph must contain both users and groups")
+        t_eval = np.arange(int(t_span[0]), int(t_span[1]) + 1)
+        return np.zeros(len(t_eval)), np.zeros(len(t_eval)), t_eval, {}
+
+    # === 2. Degree distributions ===
+    def get_degree_distribution(node_list, G):
+        degrees = np.array([G.degree(n) for n in node_list])
+        unique_k = np.unique(degrees)
+        p_k = np.array([np.mean(degrees == k) for k in unique_k])
+        p_k /= p_k.sum()
+        k_mean = np.mean(degrees)
+        k_second = np.mean(degrees ** 2)
+        return unique_k.astype(int), p_k, k_mean, k_second, degrees
+
+    k_U, p_k_U, k_mean_U, k_second_U, _ = get_degree_distribution(user_nodes, G)
+    k_G, p_k_G, k_mean_G, k_second_G, _ = get_degree_distribution(group_nodes, G)
+
+    n_classes_U = len(k_U)
+    n_classes_G = len(k_G)
+
+    # Total degree sums (for normalisation of Θ)
+    total_degree_U = n_users * k_mean_U
+    total_degree_G = n_groups * k_mean_G
+
+    # === 3. Convert discrete β to continuous rates if requested ===
+    if discrete_beta:
+        beta_UG_eff = -np.log(1.0 - beta_UG) if beta_UG < 1.0 else 10.0
+        beta_GU_eff = -np.log(1.0 - beta_GU) if beta_GU < 1.0 else 10.0
+    else:
+        beta_UG_eff = beta_UG
+        beta_GU_eff = beta_GU
+
+    # === 4. Choose source node ===
+    if source_node is None:
+        source_node = np.random.choice(nodes)
+    elif source_node not in G:
+        raise ValueError("source_node not found in graph")
+
+    source_is_group = is_group[source_node]
+
+    # === 5. Initial conditions ===
+    i_k_U_0 = np.zeros(n_classes_U)
+    i_k_G_0 = np.zeros(n_classes_G)
+
+    if source_is_group:
+        k_source = G.degree(source_node)
+        if k_source in k_G:
+            idx = np.where(k_G == k_source)[0][0]
+            n_in_class = n_groups * p_k_G[idx]
+            if n_in_class > 0:
+                i_k_G_0[idx] = 1.0 / n_in_class
+    else:
+        k_source = G.degree(source_node)
+        if k_source in k_U:
+            idx = np.where(k_U == k_source)[0][0]
+            n_in_class = n_users * p_k_U[idx]
+            if n_in_class > 0:
+                i_k_U_0[idx] = 1.0 / n_in_class
+
+    initial_state = np.concatenate([i_k_U_0, i_k_G_0])
+
+    # === 6. SIS ODE system ===
+    def ode_system(t, state):
+        i_k_U = state[:n_classes_U]
+        i_k_G = state[n_classes_U:]
+
+        # Theta functions (probability that a random edge points to an infected node of the opposite type)
+        if total_degree_G > 0:
+            infected_degree_sum_G = n_groups * np.sum((k_G) * p_k_G * i_k_G)
+            theta_G = infected_degree_sum_G / total_degree_G
+        else:
+            theta_G = 0.0
+
+        if total_degree_U > 0:
+            infected_degree_sum_U = n_users * np.sum((k_U) * p_k_U * i_k_U)
+            theta_U = infected_degree_sum_U / total_degree_U
+        else:
+            theta_U = 0.0
+
+        # Infection terms
+        infection_U = beta_GU_eff * (1.0 - i_k_U) * k_U * theta_G
+        infection_G = beta_UG_eff * (1.0 - i_k_G) * k_G * theta_U
+
+        # Recovery terms
+        recovery_U = gamma_U * i_k_U
+        recovery_G = gamma_G * i_k_G
+
+        di_k_U_dt = infection_U - recovery_U
+        di_k_G_dt = infection_G - recovery_G
+
+        # Clip to avoid negative values (should not be needed, but safe)
+        di_k_U_dt = np.maximum(di_k_U_dt, -i_k_U)   # ensure i_k does not go below 0
+        di_k_G_dt = np.maximum(di_k_G_dt, -i_k_G)
+
+        return np.concatenate([di_k_U_dt, di_k_G_dt])
+
+    # === 7. Integration ===
+    sol = solve_ivp(
+        ode_system,
+        t_span,
+        initial_state,
+        method='RK45',
+        rtol=rtol,
+        atol=atol,
+        dense_output=True,
+        max_step=0.5
+    )
+
+    # === 8. Postprocessing ===
+    t_eval = np.arange(int(t_span[0]), int(t_span[1]) + 1)
+
+    if sol.success:
+        state_solution = sol.sol(t_eval)  # (n_classes_U+n_classes_G, len(t_eval))
+
+        i_k_U_solution = state_solution[:n_classes_U, :]
+        i_k_G_solution = state_solution[n_classes_U:, :]
+
+        # Overall infection fractions (weighted by degree class probabilities)
+        users_curve = np.sum(p_k_U[:, np.newaxis] * i_k_U_solution, axis=0)
+        groups_curve = np.sum(p_k_G[:, np.newaxis] * i_k_G_solution, axis=0)
+
+        users_curve = np.clip(users_curve, 0.0, 1.0)
+        groups_curve = np.clip(groups_curve, 0.0, 1.0)
+
+        # Theta functions over time (for analysis)
+        infected_degree_sum_U = n_users * np.sum((k_U * p_k_U)[:, np.newaxis] * i_k_U_solution, axis=0)
+        infected_degree_sum_G = n_groups * np.sum((k_G * p_k_G)[:, np.newaxis] * i_k_G_solution, axis=0)
+
+        theta_U_values = infected_degree_sum_U / total_degree_U if total_degree_U > 0 else np.zeros(len(t_eval))
+        theta_G_values = infected_degree_sum_G / total_degree_G if total_degree_G > 0 else np.zeros(len(t_eval))
+
+        # Analytical estimate of characteristic time (for SI part only, not SIS)
+        # Keep it for compatibility, but note it may not be meaningful for SIS.
+        if k_mean_U > 0 and k_mean_G > 0:
+            factor_U = (k_second_U - k_mean_U) / k_mean_U
+            factor_G = (k_second_G - k_mean_G) / k_mean_G
+            if factor_U > 0 and factor_G > 0:
+                tau_analytical = 1.0 / np.sqrt(beta_UG_eff * beta_GU_eff * factor_U * factor_G)
+            else:
+                tau_analytical = np.inf
+        else:
+            tau_analytical = np.inf
+
+        metadata = {
+            't': t_eval,
+            'k_U': k_U,
+            'k_G': k_G,
+            'p_k_U': p_k_U,
+            'p_k_G': p_k_G,
+            'i_k_U': i_k_U_solution,
+            'i_k_G': i_k_G_solution,
+            'theta_U': theta_U_values,
+            'theta_G': theta_G_values,
+            'tau_analytical': tau_analytical,
+            'k_mean_U': k_mean_U,
+            'k_mean_G': k_mean_G,
+            'k_second_U': k_second_U,
+            'k_second_G': k_second_G,
+            'total_degree_U': total_degree_U,
+            'total_degree_G': total_degree_G,
+            'beta_UG_eff': beta_UG_eff,
+            'beta_GU_eff': beta_GU_eff,
+            'gamma_U': gamma_U,
+            'gamma_G': gamma_G,
+            'n_users': n_users,
+            'n_groups': n_groups,
+            'source_is_group': source_is_group,
+            'model': 'SIS_HMF'
+        }
+    else:
+        users_curve = np.zeros(len(t_eval))
+        groups_curve = np.zeros(len(t_eval))
+        metadata = {'error': 'Integration failed', 't': t_eval}
+
+    return users_curve, groups_curve, t_eval, metadata
