@@ -1,0 +1,308 @@
+import numpy as np
+import networkx as nx
+from typing import Dict, Optional, Tuple
+from joblib import Parallel, delayed
+from bisect import bisect_left
+
+
+def gillespie_sis_bipartite(
+    G: nx.Graph,
+    is_group: Dict,               # {node: True/False}, True = группа
+    beta_UG: float = 0.1,         # User → Group
+    beta_GU: float = 0.3,         # Group → User
+    gamma_U: float = 0.0,         # Recovery rate for users
+    gamma_G: float = 0.0,         # Recovery rate for groups
+    max_time: float = 20.0,
+    source_node: Optional = None,
+    seed: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Gillespie algorithm for SIS model on a bipartite graph.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Bipartite graph.
+    is_group : dict
+        {node: True if group, False if user}.
+    beta_UG : float
+        Infection rate User → Group.
+    beta_GU : float
+        Infection rate Group → User.
+    gamma_U : float
+        Recovery rate for users.
+    gamma_G : float
+        Recovery rate for groups.
+    max_time : float
+        Maximum simulation time.
+    source_node : optional
+        Source node (if None, random node is chosen).
+    seed : int, optional
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    users_fraction : np.ndarray
+        Fraction of infected users at integer times [0, 1, ..., max_time].
+    groups_fraction : np.ndarray
+        Fraction of infected groups at integer times [0, 1, ..., max_time].
+    t_eval : np.ndarray
+        Array of time points.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    nodes = list(G.nodes())
+    n_total = len(nodes)
+
+    if n_total == 0:
+        t_eval = np.arange(int(max_time) + 1)
+        return np.zeros(len(t_eval)), np.zeros(len(t_eval)), t_eval
+
+    # Split nodes by type
+    users = [n for n in nodes if not is_group[n]]
+    groups = [n for n in nodes if is_group[n]]
+
+    n_users = len(users)
+    n_groups = len(groups)
+
+    if n_users == 0 or n_groups == 0:
+        t_eval = np.arange(int(max_time) + 1)
+        return np.zeros(len(t_eval)), np.zeros(len(t_eval)), t_eval
+
+    # Index mapping
+    node_to_idx = {node: i for i, node in enumerate(nodes)}
+    is_group_array = np.array([is_group[n] for n in nodes], dtype=bool)
+
+    # Neighbors as lists of indices
+    neighbors = [
+        np.array([node_to_idx[neigh] for neigh in G.neighbors(node)], dtype=np.int32)
+        for node in nodes
+    ]
+
+    # Source node
+    if source_node is None:
+        source_idx = np.random.randint(n_total)
+    elif source_node in node_to_idx:
+        source_idx = node_to_idx[source_node]
+    else:
+        raise ValueError(f"source_node {source_node} not found in graph")
+
+    source_is_group = is_group_array[source_idx]
+
+    # Initialize states
+    infected = np.zeros(n_total, dtype=bool)
+    infected[source_idx] = True
+    n_user_inf = 0 if source_is_group else 1
+    n_group_inf = 1 if source_is_group else 0
+
+    # rates[i]: event rate for node i
+    #   if infected: rates[i] = recovery rate (gamma)
+    #   else:        rates[i] = sum of infection rates from infected neighbors
+    rates = np.zeros(n_total, dtype=np.float64)
+
+    # Initial rates for neighbors of the source
+    for nb in neighbors[source_idx]:
+        if not infected[nb]:
+            if source_is_group and not is_group_array[nb]:   # Group -> User
+                rates[nb] = beta_GU
+            elif not source_is_group and is_group_array[nb]: # User -> Group
+                rates[nb] = beta_UG
+            # else: same type – no edge in bipartite graph (should not happen)
+
+    # Source recovery rate (if gamma > 0)
+    if source_is_group:
+        rates[source_idx] = gamma_G
+    else:
+        rates[source_idx] = gamma_U
+
+    # Active nodes (rates > 0)
+    active_mask = rates > 0
+    active_indices = np.where(active_mask)[0]
+    if len(active_indices) > 0:
+        active_rates = rates[active_indices]
+        cumsum = np.cumsum(active_rates)
+        total_rate = cumsum[-1]
+    else:
+        cumsum = np.array([])
+        total_rate = 0.0
+
+    # Event list: (time, n_user_inf, n_group_inf)
+    events = [(0.0, n_user_inf, n_group_inf)]
+    t = 0.0
+
+    max_events = 20 * (n_users + n_groups)  # Safety limit
+
+    for _ in range(max_events):
+        if total_rate <= 0 or t > max_time:
+            break
+
+        # Time to next event
+        tau = np.random.exponential(1.0 / total_rate)
+        t += tau
+        if t > max_time:
+            break
+
+        # Choose which node's event occurs (binary search)
+        r = np.random.random() * total_rate
+        idx_in_active = bisect_left(cumsum, r)
+        idx_in_active = max(0, min(idx_in_active, len(cumsum) - 1))
+        chosen_idx = active_indices[idx_in_active]
+
+        # Determine event type based on current state
+        if infected[chosen_idx]:
+            # ---------- RECOVERY EVENT ----------
+            infected[chosen_idx] = False
+            if is_group_array[chosen_idx]:
+                n_group_inf -= 1
+            else:
+                n_user_inf -= 1
+
+            # Update rates for this node: now it's susceptible, compute new infection rate
+            new_rate = 0.0
+            for nb in neighbors[chosen_idx]:
+                if infected[nb]:
+                    # Neighbor is infected, so chosen node can be infected by it
+                    if is_group_array[nb] and not is_group_array[chosen_idx]:   # Group -> User
+                        new_rate += beta_GU
+                    elif not is_group_array[nb] and is_group_array[chosen_idx]: # User -> Group
+                        new_rate += beta_UG
+            rates[chosen_idx] = new_rate
+
+            # Decrease infection rates of susceptible neighbors because chosen node is no longer infected
+            for nb in neighbors[chosen_idx]:
+                if not infected[nb]:   # nb is susceptible
+                    # Rate reduction depends on direction: chosen -> nb
+                    if is_group_array[chosen_idx] and not is_group_array[nb]:   # Group -> User
+                        rates[nb] -= beta_GU
+                    elif not is_group_array[chosen_idx] and is_group_array[nb]: # User -> Group
+                        rates[nb] -= beta_UG
+                    # Ensure non‑negative due to possible floating errors
+                    if rates[nb] < 0:
+                        rates[nb] = 0.0
+
+            # Update active status for chosen node and neighbors
+            # (will be rebuilt after loop, but we can update mask directly)
+            active_mask[chosen_idx] = rates[chosen_idx] > 0
+            for nb in neighbors[chosen_idx]:
+                if not infected[nb]:
+                    active_mask[nb] = rates[nb] > 0
+
+        else:
+            # ---------- INFECTION EVENT ----------
+            infected[chosen_idx] = True
+            if is_group_array[chosen_idx]:
+                n_group_inf += 1
+            else:
+                n_user_inf += 1
+
+            # Set recovery rate for this node (if gamma > 0)
+            if is_group_array[chosen_idx]:
+                rates[chosen_idx] = gamma_G
+            else:
+                rates[chosen_idx] = gamma_U
+
+            # Increase infection rates of susceptible neighbors
+            for nb in neighbors[chosen_idx]:
+                if not infected[nb]:   # nb is susceptible
+                    if is_group_array[chosen_idx] and not is_group_array[nb]:   # Group -> User
+                        rates[nb] += beta_GU
+                    elif not is_group_array[chosen_idx] and is_group_array[nb]: # User -> Group
+                        rates[nb] += beta_UG
+                    # Newly positive rate -> mark as active
+                    active_mask[nb] = True
+
+            # Update active status for chosen node
+            active_mask[chosen_idx] = rates[chosen_idx] > 0
+
+        # Rebuild active indices and cumulative sums
+        active_indices = np.where(active_mask)[0]
+        if len(active_indices) > 0:
+            active_rates = rates[active_indices]
+            cumsum = np.cumsum(active_rates)
+            total_rate = cumsum[-1]
+        else:
+            total_rate = 0.0
+            # No events possible, simulation will end
+            break
+
+        events.append((t, n_user_inf, n_group_inf))
+
+    # Convert to fractions at integer times
+    t_eval = np.arange(int(max_time) + 1)
+    users_fraction = np.zeros(len(t_eval), dtype=np.float64)
+    groups_fraction = np.zeros(len(t_eval), dtype=np.float64)
+
+    if len(events) > 0:
+        event_idx = 0
+        for t_int in range(len(t_eval)):
+            while event_idx < len(events) - 1 and events[event_idx + 1][0] <= t_int:
+                event_idx += 1
+            users_fraction[t_int] = events[event_idx][1] / n_users
+            groups_fraction[t_int] = events[event_idx][2] / n_groups
+
+    # Clip to [0,1] for safety
+    users_fraction = np.clip(users_fraction, 0.0, 1.0)
+    groups_fraction = np.clip(groups_fraction, 0.0, 1.0)
+
+    return users_fraction, groups_fraction, t_eval
+
+
+
+def gillespie_sis_bipartite_ensemble(
+    G: nx.Graph,
+    is_group: Dict,
+    beta_UG: float = 0.1,
+    beta_GU: float = 0.3,
+    gamma_U: float = 0.1,
+    gamma_G: float = 0.1,
+    max_time: float = 20.0,
+    source_node: Optional = None,
+    n_samples: int = 100,
+    n_jobs: int = -1,
+    seed: Optional[int] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+
+    def single_run(seed_offset):
+        run_seed = seed + seed_offset if seed is not None else None
+
+        u, g, t = gillespie_sis_bipartite(
+            G=G,
+            is_group=is_group,
+            beta_UG=beta_UG,
+            beta_GU=beta_GU,
+            gamma_U=gamma_U,
+            gamma_G=gamma_G,
+            max_time=max_time,
+            source_node=source_node,
+            seed=run_seed
+        )
+        return u, g, t
+
+    if n_jobs == -1:
+        from multiprocessing import cpu_count
+        n_jobs = cpu_count()
+
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(single_run)(i) for i in range(n_samples)
+    )
+
+    users_all = np.stack([r[0] for r in results], axis=0)
+    groups_all = np.stack([r[1] for r in results], axis=0)
+    t_eval = results[0][2]
+
+    users_mean = np.mean(users_all, axis=0)
+    groups_mean = np.mean(groups_all, axis=0)
+
+    users_std = np.std(users_all, axis=0, ddof=1)
+    groups_std = np.std(groups_all, axis=0, ddof=1)
+
+    metadata = {
+        "users_std": users_std,
+        "groups_std": groups_std,
+        "users_se": users_std / np.sqrt(n_samples),
+        "groups_se": groups_std / np.sqrt(n_samples),
+        "n_samples": n_samples,
+    }
+
+    return users_mean, groups_mean, t_eval, metadata
