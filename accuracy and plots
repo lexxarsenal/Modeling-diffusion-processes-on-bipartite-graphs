@@ -1,0 +1,258 @@
+import numpy as np
+
+
+def calculate_accuracy_metrics(gill_mean, gill_std, model_curve, n_samples=100):
+    """
+    Метрики точности детерминистической модели относительно ансамбля Гиллеспи.
+
+    gill_mean : np.ndarray
+        Средняя траектория Гиллеспи.
+    gill_std : np.ndarray
+        Стандартное отклонение траекторий Гиллеспи по ансамблю.
+    model_curve : np.ndarray
+        Траектория IBMF или DBA.
+    n_samples : int
+        Число запусков Гиллеспи.
+    """
+
+    gill_mean = np.asarray(gill_mean, dtype=float)
+    gill_std = np.asarray(gill_std, dtype=float)
+    model_curve = np.asarray(model_curve, dtype=float)
+
+    if not (len(gill_mean) == len(gill_std) == len(model_curve)):
+        raise ValueError("gill_mean, gill_std и model_curve должны иметь одинаковую длину.")
+
+    # Ошибка модели относительно среднего Гиллеспи
+    errors = model_curve - gill_mean
+
+    mse = np.mean(errors ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(errors))
+    max_abs_error = np.max(np.abs(errors))
+
+    # Средняя дисперсия стохастического процесса
+    var_gill = np.mean(gill_std ** 2)
+    std_gill = np.sqrt(var_gill)
+
+    # Нормированная MSE: ошибка модели относительно разброса Гиллеспи
+    nmse = mse / var_gill if var_gill > 0 else np.inf
+
+    # Обратная величина: во сколько раз дисперсия Гиллеспи больше ошибки модели
+    variance_to_mse = var_gill / mse if mse > 0 else np.inf
+
+    # Доверительный интервал для среднего Гиллеспи
+    ci_95_halfwidth_t = 1.96 * gill_std / np.sqrt(n_samples)
+    ci_95_halfwidth_mean = np.mean(ci_95_halfwidth_t)
+
+    ci_lower = gill_mean - ci_95_halfwidth_t
+    ci_upper = gill_mean + ci_95_halfwidth_t
+
+    within_95ci_mean = np.mean(
+        (model_curve >= ci_lower) & (model_curve <= ci_upper)
+    ) * 100
+
+    # Попадание в естественный разброс процесса ±1σ
+    sigma_lower = gill_mean - gill_std
+    sigma_upper = gill_mean + gill_std
+
+    within_1sigma_process = np.mean(
+        (model_curve >= sigma_lower) & (model_curve <= sigma_upper)
+    ) * 100
+
+    return {
+        "MSE": mse,
+        "RMSE": rmse,
+        "MAE": mae,
+        "Max_Abs_Error": max_abs_error,
+        "Var_Gillespie": var_gill,
+        "Std_Gillespie": std_gill,
+        "nMSE": nmse,
+        "Variance_to_MSE": variance_to_mse,
+        "CI_95_halfwidth": ci_95_halfwidth_mean,
+        "Within_95CI_Mean_%": within_95ci_mean,
+        "Within_1sigma_Process_%": within_1sigma_process,
+    }
+
+
+def print_accuracy_report(metrics_ibmf, metrics_dba, title="Метрики точности"):
+    """
+    Красивый вывод метрик IBMF и DBA относительно ансамбля Гиллеспи.
+    Ожидает словари, возвращаемые calculate_accuracy_metrics().
+    """
+
+    width = 92
+    print("=" * width)
+    print(title)
+    print("=" * width)
+    print(f"{'Метрика':<32} | {'Gillespie':<18} | {'IBMF':<18} | {'DBA':<18}")
+    print("-" * width)
+
+    # Характеристики стохастического эталона
+    print(
+        f"{'Дисперсия процесса':<32} | "
+        f"{metrics_ibmf['Var_Gillespie']:<18.2e} | "
+        f"{'—':<18} | "
+        f"{'—':<18}"
+    )
+
+    print(
+        f"{'Std процесса (σ)':<32} | "
+        f"{metrics_ibmf['Std_Gillespie']:<18.2e} | "
+        f"{'—':<18} | "
+        f"{'—':<18}"
+    )
+
+    print(
+        f"{'95% CI среднего':<32} | "
+        f"±{metrics_ibmf['CI_95_halfwidth']:<17.2e} | "
+        f"{'—':<18} | "
+        f"{'—':<18}"
+    )
+
+    print("-" * width)
+
+    # Ошибки моделей
+    print(
+        f"{'MSE':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['MSE']:<18.2e} | "
+        f"{metrics_dba['MSE']:<18.2e}"
+    )
+
+    print(
+        f"{'nMSE = MSE / Var_G':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['nMSE']:<18.3f} | "
+        f"{metrics_dba['nMSE']:<18.3f}"
+    )
+
+    print(
+        f"{'MAE':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['MAE']:<18.2e} | "
+        f"{metrics_dba['MAE']:<18.2e}"
+    )
+
+    print(
+        f"{'Макс. абсолютная ошибка':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['Max_Abs_Error']:<18.2e} | "
+        f"{metrics_dba['Max_Abs_Error']:<18.2e}"
+    )
+
+    print(
+        f"{'Точек внутри ±1σ':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['Within_1sigma_Process_%']:<17.1f}% | "
+        f"{metrics_dba['Within_1sigma_Process_%']:<17.1f}%"
+    )
+
+    print(
+        f"{'Точек внутри 95% CI среднего':<32} | "
+        f"{'—':<18} | "
+        f"{metrics_ibmf['Within_95CI_Mean_%']:<17.1f}% | "
+        f"{metrics_dba['Within_95CI_Mean_%']:<17.1f}%"
+    )
+
+    print("=" * width)
+
+
+metrics_ibmf_u = calculate_accuracy_metrics(
+    gill_mean=users_mean,
+    gill_std=meta["users_std"],
+    model_curve=ibmf_users,
+    n_samples=100
+)
+
+metrics_dba_u = calculate_accuracy_metrics(
+    gill_mean=users_mean,
+    gill_std=meta["users_std"],
+    model_curve=dba_users,
+    n_samples=100
+)
+
+metrics_ibmf_v = calculate_accuracy_metrics(
+    gill_mean=groups_mean,
+    gill_std=meta["groups_std"],
+    model_curve=ibmf_groups,
+    n_samples=100
+)
+
+metrics_dba_v = calculate_accuracy_metrics(
+    gill_mean=groups_mean,
+    gill_std=meta["groups_std"],
+    model_curve=dba_groups,
+    n_samples=100
+)
+
+print_accuracy_report(
+    metrics_ibmf_u,
+    metrics_dba_u,
+    title="Пользователи U: IBMF и DBA относительно Gillespie"
+)
+
+print_accuracy_report(
+    metrics_ibmf_v,
+    metrics_dba_v,
+    title="Группы V: IBMF и DBA относительно Gillespie"
+)
+
+
+time_vec = np.arange(max_t + 1)
+
+# --- График 1: Пользователи ---
+plt.figure(figsize=(14, 6))
+plt.subplot(1, 2, 1)
+#plt.plot(time_vec, users_exact, '-', color='red', label='Точный метод', linewidth=2)
+plt.plot(t_eval, users_sample, '', color='red', label='Gillespie', markersize=6, alpha=0.8)
+#plt.plot(time_vec, users_markov, '', color='blue', label='Марковская', markersize=4)
+#plt.plot(time_vec, users_mf, '--', color='purple', label='Mean-field', markersize=3)
+# В графике:
+#plt.plot(time_vec, users_ode, '-', color='brown', label='Mean-field ODE', linewidth=2)
+#plt.plot(t_ode, users_ode_enh, '--', color='magenta', label='Enhanced ODE')
+#plt.plot(t_slow, users_ode_slow, '--', color='cyan', label='ODE (slow growth)')
+
+#plt.plot(t_ode_basic, users_ode_basic, '-', color='green', label='ODE (базовая)', linewidth=2.5)
+plt.plot(t_ode_exp, users_ode_exp, ':', color='blue',  label='mean-field', linewidth=2.5)
+#plt.plot(t_ode_exp, u_qmf, ':', color='black',  label='mean-field-cor', linewidth=2.5)
+plt.plot(t_ode_exp, users_curve, ':', color='green',  label='HMF', linewidth=2.5)
+#plt.plot(t_ode_exp, u_hmf_corr, ':', color='brown',  label='HMF-cor', linewidth=2.5)
+#plt.plot(t_ode_both, users_ode_both, '--', color='red',  label='С обоими в exp', linewidth=2, markersize=2)
+#plt.plot(t_ode_asym, users_ode_asym, '-.', color='purple', label='Асимметричная', linewidth=2)
+
+plt.title("Users")
+plt.xlabel("Time $t$")
+plt.ylabel("Expected share of informed users")
+plt.ylim(0, 1.02)
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.legend()
+
+# --- График 2: Группы ---
+plt.subplot(1, 2, 2)
+#plt.plot(time_vec, groups_exact, '-', color='red', label='Точный метод', linewidth=2)
+plt.plot(time_vec, groups_sample, '', color='red', label='Gillespie', markersize=6, alpha=0.8)
+#plt.plot(time_vec, groups_markov, '', color='blue', label='Марковская', markersize=4)
+#plt.plot(time_vec, groups_mf, '--', color='purple', label='Mean-field', markersize=3)
+#plt.plot(t_ode, groups_ode_enh, '--', color='magenta', label='Enhanced ODE')
+
+#plt.plot(t_ode_basic, groups_ode_basic, '-', color='green', label='ODE (базовая)', linewidth=2.5)
+plt.plot(t_ode_exp, groups_ode_exp, ':', color='blue', label='mean-field', linewidth=2.5)
+#plt.plot(t_ode_exp, g_qmf, ':', color='black',  label='mean-field-cor', linewidth=2.5)
+plt.plot(t_ode_exp,groups_curve, ':', color='green',  label='HMF', linewidth=2.5)
+#plt.plot(t_ode_exp, g_hmf_corr, ':', color='brown',  label='HMF-cor', linewidth=2.5)
+#plt.plot(t_ode_both, groups_ode_both, '--', color='red',   label='С обоими в exp', linewidth=2,  markersize=2)
+#plt.plot(t_ode_asym, groups_ode_asym, '-.', color='purple', label='Асимметричная', linewidth=2)
+
+plt.title("Groups")
+plt.xlabel("Time  $t$")
+plt.ylabel("Expected share of informed groups")
+plt.ylim(0, 1.02)
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.legend()
+
+plt.suptitle(f" β_VU={beta_gu}, β_UV={beta_ug}", fontsize=14)
+plt.tight_layout()
+plt.savefig('g2.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
